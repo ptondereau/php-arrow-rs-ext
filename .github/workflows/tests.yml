@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  tests-build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        php-version: ["8.2", "8.3", "8.4", "8.5"]
+
+    name: Build extension and run tests
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: "Install PHP"
+        uses: "shivammathur/setup-php@v2"
+        with:
+          php-version: "${{ matrix.php-version }}"
+          coverage: "none"
+          ini-values: "memory_limit=-1"
+          extensions: mbstring
+          tools: composer:v2.9.5
+
+      - name: Build
+        run: cargo build --release --all-features
+
+      - name: Run linter (clippy)
+        run: cargo clippy -- -D warnings
+
+      - name: "Install dependencies (Composer)"
+        uses: "ramsey/composer-install@v3"
+
+      - name: Setup Mago
+        if: ${{ matrix.php-version == '8.5' }}
+        uses: nhedger/setup-mago@v1
+
+      - name: Run Mago
+        if: ${{ matrix.php-version == '8.5' }}
+        run: |
+          mago format --dry-run
+          mago lint --reporting-format=github
+
+      - name: "Run PHPUnit"
+        run: php -dextension=./target/release/libparquet.so vendor/bin/phpunit
