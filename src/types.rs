@@ -294,17 +294,42 @@ fn append_null_to_builder(builder: &mut dyn ArrayBuilder, data_type: &DataType) 
         DataType::Time64(TimeUnit::Microsecond) => downcast_builder!(builder, Time64MicrosecondBuilder).append_null(),
         DataType::Decimal128(_, _) => downcast_builder!(builder, Decimal128Builder).append_null(),
         DataType::Binary => downcast_builder!(builder, BinaryBuilder).append_null(),
+        DataType::List(_) => {
+            let lb = builder.as_any_mut().downcast_mut::<ListBuilder<Box<dyn ArrayBuilder>>>()
+                .expect("builder downcast to ListBuilder must succeed after DataType match");
+            lb.append(false);
+        }
+        DataType::Struct(fields) => {
+            let sb = builder.as_any_mut().downcast_mut::<StructBuilder>()
+                .expect("builder downcast to StructBuilder must succeed after DataType match");
+            for (fi, field) in fields.iter().enumerate() {
+                let child = sb.field_builders_mut().get_mut(fi)
+                    .expect("field index valid in StructBuilder");
+                append_null_to_builder(child.as_mut(), field.data_type());
+            }
+            sb.append(false);
+        }
+        DataType::Map(_, _) => {
+            let mb = builder.as_any_mut().downcast_mut::<arrow::array::MapBuilder<Box<dyn ArrayBuilder>, Box<dyn ArrayBuilder>>>()
+                .expect("builder downcast to MapBuilder must succeed after DataType match");
+            let _ = mb.append(false);
+        }
         _ => {}
     }
 }
 
-fn append_value_to_builder(
+#[allow(clippy::too_many_lines)]
+fn append_to_dyn_builder(
     builder: &mut dyn ArrayBuilder,
     val: &Zval,
     data_type: &DataType,
     col_name: &str,
     row_idx: usize,
 ) -> PhpResult<()> {
+    if val.is_null() {
+        append_null_to_builder(builder, data_type);
+        return Ok(());
+    }
     match data_type {
         DataType::Boolean => {
             let v = val.bool().ok_or_else(|| type_error(col_name, "boolean", row_idx))?;
@@ -356,6 +381,59 @@ fn append_value_to_builder(
             let v = val.str().map(|s| s.as_bytes().to_vec()).ok_or_else(|| type_error(col_name, "binary", row_idx))?;
             downcast_builder!(builder, BinaryBuilder).append_value(&v);
         }
+        DataType::List(element_field) => {
+            let lb = builder.as_any_mut().downcast_mut::<ListBuilder<Box<dyn ArrayBuilder>>>()
+                .expect("builder downcast to ListBuilder must succeed after DataType match");
+            let php_arr = val.array().ok_or_else(|| type_error(col_name, "array (for list)", row_idx))?;
+            for (_idx, elem) in php_arr {
+                append_to_dyn_builder(lb.values().as_mut(), elem, element_field.data_type(), col_name, row_idx)?;
+            }
+            lb.append(true);
+        }
+        DataType::Struct(fields) => {
+            let sb = builder.as_any_mut().downcast_mut::<StructBuilder>()
+                .expect("builder downcast to StructBuilder must succeed after DataType match");
+            let inner_arr = val.array().ok_or_else(|| type_error(col_name, "array (for struct)", row_idx))?;
+            for (fi, field) in fields.iter().enumerate() {
+                let null_zval = Zval::new();
+                let val_ref = inner_arr.get(field.name().as_str()).unwrap_or(&null_zval);
+                let child = sb.field_builders_mut().get_mut(fi)
+                    .expect("field index valid in StructBuilder");
+                append_to_dyn_builder(child.as_mut(), val_ref, field.data_type(), col_name, row_idx)?;
+            }
+            sb.append(true);
+        }
+        DataType::Map(entries_field, _) => {
+            let DataType::Struct(struct_fields) = entries_field.data_type() else {
+                return Err(PhpException::from_class::<ParquetException>(
+                    format!("Map entries for '{col_name}' is not a struct")
+                ));
+            };
+            let key_field = &struct_fields[0];
+            let value_field = &struct_fields[1];
+            let mb = builder.as_any_mut().downcast_mut::<arrow::array::MapBuilder<Box<dyn ArrayBuilder>, Box<dyn ArrayBuilder>>>()
+                .expect("builder downcast to MapBuilder must succeed after DataType match");
+            let php_arr = val.array().ok_or_else(|| type_error(col_name, "array (for map)", row_idx))?;
+            for (k, v) in php_arr {
+                let key_str = match k {
+                    ext_php_rs::types::ArrayKey::Long(n) => n.to_string(),
+                    ext_php_rs::types::ArrayKey::String(s) => s,
+                    ext_php_rs::types::ArrayKey::Str(s) => (*s).to_owned(),
+                };
+                let mut key_zval = Zval::new();
+                match key_field.data_type() {
+                    DataType::Int32 | DataType::Int64 => {
+                        if let Ok(n) = key_str.parse::<i64>() { key_zval.set_long(n); }
+                    }
+                    _ => { let _ = key_zval.set_string(&key_str, false); }
+                }
+                append_to_dyn_builder(mb.keys().as_mut(), &key_zval, key_field.data_type(), col_name, row_idx)?;
+                append_to_dyn_builder(mb.values().as_mut(), v, value_field.data_type(), col_name, row_idx)?;
+            }
+            mb.append(true).map_err(|e| {
+                PhpException::from_class::<ParquetException>(format!("Failed to append map for '{col_name}': {e}"))
+            })?;
+        }
         _ => {
             return Err(PhpException::from_class::<ParquetException>(format!(
                 "Unsupported nested element type for column '{col_name}': {data_type}"
@@ -363,20 +441,6 @@ fn append_value_to_builder(
         }
     }
     Ok(())
-}
-
-fn append_to_dyn_builder(
-    builder: &mut dyn ArrayBuilder,
-    val: &Zval,
-    data_type: &DataType,
-    col_name: &str,
-    row_idx: usize,
-) -> PhpResult<()> {
-    if val.is_null() {
-        append_null_to_builder(builder, data_type);
-        return Ok(());
-    }
-    append_value_to_builder(builder, val, data_type, col_name, row_idx)
 }
 
 fn build_struct_array(
@@ -421,13 +485,7 @@ fn build_struct_array(
                     .field_builders_mut()
                     .get_mut(field_idx)
                     .expect("field index must be valid within StructBuilder");
-                append_to_dyn_builder(
-                    child_builder.as_mut(),
-                    &Zval::new(),
-                    field.data_type(),
-                    &child_names[field_idx],
-                    i,
-                )?;
+                append_null_to_builder(child_builder.as_mut(), field.data_type());
             }
             struct_builder.append(false);
         }
@@ -466,6 +524,9 @@ fn build_map_array(
     .with_keys_field(key_field.clone())
     .with_values_field(value_field.clone());
 
+    let key_col_name = format!("{col_name}.key");
+    let value_col_name = format!("{col_name}.value");
+
     for (i, row) in rows.iter().enumerate() {
         match get_field_value(row, col_name, i, nullable)? {
             Some(val) => {
@@ -493,14 +554,14 @@ fn build_map_array(
                         map_builder.keys(),
                         &key_zval,
                         key_field.data_type(),
-                        &format!("{col_name}.key"),
+                        &key_col_name,
                         i,
                     )?;
                     append_to_dyn_builder(
                         map_builder.values(),
                         v,
                         value_field.data_type(),
-                        &format!("{col_name}.value"),
+                        &value_col_name,
                         i,
                     )?;
                 }
@@ -533,25 +594,11 @@ fn get_field_value<'a>(
     })?;
 
     match arr.get(col_name) {
-        Some(val) if val.is_null() => {
-            if nullable {
-                Ok(None)
-            } else {
-                Err(PhpException::from_class::<ParquetException>(format!(
-                    "Missing required column '{col_name}' in row {row_index}"
-                )))
-            }
-        }
-        Some(val) => Ok(Some(val)),
-        None => {
-            if nullable {
-                Ok(None)
-            } else {
-                Err(PhpException::from_class::<ParquetException>(format!(
-                    "Missing required column '{col_name}' in row {row_index}"
-                )))
-            }
-        }
+        Some(val) if !val.is_null() => Ok(Some(val)),
+        _ if nullable => Ok(None),
+        _ => Err(PhpException::from_class::<ParquetException>(format!(
+            "Missing required column '{col_name}' in row {row_index}"
+        ))),
     }
 }
 
