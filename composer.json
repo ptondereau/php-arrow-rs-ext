@@ -26,7 +26,7 @@
     "require-dev": {
         "phpunit/phpunit": "^10",
         "carthage-software/mago": "^1",
-        "flow-php/parquet": "^0.33.0"
+        "flow-php/parquet": "^0.32 || ^0.33"
     },
     "config": {
         "allow-plugins": {

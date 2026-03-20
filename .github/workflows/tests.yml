@@ -51,6 +51,8 @@ jobs:
 
       - name: "Install dependencies (Composer)"
         uses: "ramsey/composer-install@v3"
+        with:
+          dependency-versions: "highest"
 
       - name: Setup Mago
         if: ${{ matrix.php-version == '8.5' }}
